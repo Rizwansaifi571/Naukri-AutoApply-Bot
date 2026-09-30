@@ -111,8 +111,8 @@ Naukri-autoapply-bot/
 ### 1. Clone the project
 
 ```bash
-git clone https://github.com/lordzohar/Naukri-autoapply-bot.git
-cd Naukri-autoapply-bot
+git clone https://github.com/Rizwansaifi571/Naukri-AutoApply-Bot.git
+cd Naukri-Autoapply-bot
 ```
 
 ### 2. Create a virtual environment
@@ -265,12 +265,6 @@ passed,failed
 - `passed`: applications with a detected final Naukri confirmation
 - `failed`: jobs that could not be applied to or were not confirmed
 
-## Screenshots and Demo
-
-No screenshots or hosted demo are currently included in this repository.
-
-For a live walkthrough, run one of the scripts locally with a test account and review the terminal logs and generated CSV output.
-
 ## Safety and Responsible Use
 
 - Use the project only with an account you own or are authorized to use.
@@ -298,12 +292,6 @@ Potential improvements include:
 - Configurable headless execution
 - Automated test coverage for parsing and filtering logic
 - Optional screenshots or run summaries for each application attempt
-
-## Original Project
-
-This project is based on the original repository:
-
-[github.com/lordzohar/Naukri-autoapply-bot](https://github.com/lordzohar/Naukri-autoapply-bot)
 
 ## Disclaimer
 
