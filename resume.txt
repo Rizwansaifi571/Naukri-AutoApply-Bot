@@ -1,0 +1,54 @@
+MOHD RIZWAN
+West Delhi, India
+Email: rizwansaifi2614@gmail.com
+Phone: +91-8745943319
+Portfolio | GitHub | LinkedIn | LeetCode
+
+EDUCATION
+K.R. Mangalam University, Gurugram
+B.Tech in Computer Science - Specialization in Data Science
+CGPA: 8.92 / 10.0
+Aug 2023 - Jun 2027
+
+EXPERIENCE
+Data Science Intern | Epigenome.ai Fundamental Research Pvt. Ltd. - Gurugram
+Jun 2025 - Jul 2025
+- Architected an AI-driven health intelligence framework integrating predictive analytics, behavioral modeling, and optimization pipelines for enterprise healthcare applications, contributing to 3 strategic AI/ML initiatives.
+- Engineered an enterprise Generative AI support assistant leveraging NLP, proprietary knowledge bases, and REST APIs to automate complex query resolution, reducing reliance on manual support workflows.
+- Implemented ML-based demand forecasting and supply chain optimization using time-series forecasting and reinforcement learning across production-grade data pipelines.
+
+Software Developer Intern | Shivoham Techno Services Pvt. Ltd. - Delhi
+Jul 2024
+- Engineered a real-time PPE detection system using YOLOv5 with custom-annotated datasets, achieving 92% detection accuracy and reducing manual safety inspections by 50% at industrial facilities.
+- Delivered an Electron + Flask monitoring dashboard with REST APIs for 33KV substation busbar temperature telemetry, reducing fault detection time by 30% through real-time anomaly visualization.
+
+PROJECTS
+ResumeProof - Distributed AI Resume Verification Ecosystem
+GitHub | resumeproof.online
+Jul 2026 - Present
+- Architected a dual-microservice system (MS1: Node.js/Express/TypeScript/Prisma; MS2: Python/FastAPI) with BullMQ/Redis async queues and PostgreSQL, delivering AI-driven skill verification at scale.
+- Designed LangGraph + LangChain agentic pipelines on Groq (LLaMA 3) to autonomously analyze GitHub repositories via PyGithub, generating recruiter-ready verification reports with structured evidence extraction.
+- Engineered webhook delivery infrastructure and REST API contracts across decoupled microservices, ensuring idempotent event propagation and reliable async processing for multi-tenant recruiter workflows.
+- Deployed on AWS EC2 + RDS with PM2 process management, serving Next.js 14 / React / Tailwind CSS portals for separate recruiter and candidate interfaces.
+
+AI Faculty Presence Verification System | Team Project - Selected by SOET
+Jan 2026 - May 2026
+- Engineered a Flask REST API backend with MySQL integration, automating faculty attendance verification across 700+ daily classes and 250+ classrooms using existing CCTV infrastructure.
+- Developed an end-to-end computer vision pipeline using InsightFace, RetinaFace, and ArcFace with CLAHE preprocessing, blur detection, and ArcFace embedding generation for robust real-world recognition.
+- Implemented OCR-based timestamp extraction, cosine similarity matching, dynamic thresholding, and IOU-based multi-object tracking at approximately 15-20 FPS, significantly reducing false-positive attendance events.
+
+SKILLS
+Languages: Python, Java, C++, JavaScript, TypeScript, R
+Backend: Node.js, Express.js, FastAPI, Flask, REST APIs, JWT, Prisma, Zod, BullMQ, Electron
+AI / ML: Machine Learning, Deep Learning, NLP, LangChain, LangGraph, Prompt Engineering, RAG, Scikit-learn, Pandas, NumPy, PyTorch
+Generative AI: LLMs, Groq, LLaMA 3, Gemini, OpenAI APIs, Generative AI
+Computer Vision: OpenCV, YOLO, InsightFace, RetinaFace, ArcFace, EasyOCR, Facial Recognition
+Databases: PostgreSQL, MySQL, MongoDB, Redis
+Cloud & DevOps: AWS (EC2, RDS, S3), Docker, Linux, PM2, Git, GitHub
+Core CS: Data Structures & Algorithms, OOP, System Design, DBMS, Operating Systems
+
+ACHIEVEMENTS
+- Solved 350+ DSA problems on LeetCode.
+- Secured Runner-up (2nd Place) in Deep Data Hackathon against 150+ teams.
+- Awarded 2nd Position - Best Project Award in Semester 6 by SOET.
+- Published a peer-reviewed book chapter in a multidisciplinary academic publication by Red Shine Publications.
