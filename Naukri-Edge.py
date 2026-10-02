@@ -59,15 +59,18 @@ ROLE_FILTERS = [item.strip().lower() for item in os.getenv('ROLE_FILTERS', '').s
 EXPERIENCE_FILTERS = [item.strip().lower() for item in os.getenv('EXPERIENCE_FILTERS', '').split(',') if item.strip()]
 EXCLUDE_FILTERS = [item.strip().lower() for item in os.getenv('EXCLUDE_FILTERS', '').split(',') if item.strip()]
 REQUIRE_DIRECT_APPLY = os.getenv('REQUIRE_DIRECT_APPLY', 'true').strip().lower() not in ('0', 'false', 'no')
+APPLY_DETECTION_TIMEOUT = max(0.5, float(os.getenv('APPLY_DETECTION_TIMEOUT', '2')))
 
 # --- Limits ---
 MAX_APPLICATIONS = int(os.getenv('MAX_APPLICATIONS', '50'))
 PAGES_PER_KEYWORD = int(os.getenv('PAGES_PER_KEYWORD', '2'))
 ANSWERS_CSV = os.getenv('ANSWERS_CSV', 'application_answers.csv')
 RESUME_FILE = os.getenv('RESUME_FILE', 'resume.txt')
-QUESTION_TIMEOUT = min(int(os.getenv('QUESTION_TIMEOUT', '20')), 20)
-QUESTIONNAIRE_TIMEOUT = int(os.getenv('QUESTIONNAIRE_TIMEOUT', '600'))
-JOB_TIMEOUT = min(int(os.getenv('JOB_TIMEOUT', '180')), 180)
+POST_TIMEOUT = max(30, int(os.getenv('POST_TIMEOUT', os.getenv('JOB_TIMEOUT', '90'))))
+MANUAL_ANSWER_TIMEOUT = max(
+    10, int(os.getenv('MANUAL_ANSWER_TIMEOUT', os.getenv('QUESTION_TIMEOUT', '30')))
+)
+QUESTION_POLL_INTERVAL = max(0.25, float(os.getenv('QUESTION_POLL_INTERVAL', '0.5')))
 
 # --- Edge Driver Path (optional, only if NOT using webdriver-manager) ---
 EDGE_DRIVER_PATH = os.getenv('EDGE_DRIVER_PATH', '')
@@ -335,18 +338,20 @@ def collect_job_links_from_tab(driver, window_handle):
     links = []
     try:
         driver.switch_to.window(window_handle)
-        time.sleep(3)  # Wait for page to fully render
+        time.sleep(1)  # Allow the result cards to mount before parsing
 
         soup = BeautifulSoup(driver.page_source, 'html5lib')
 
         # New selector: find all job tuple wrappers
         job_wrappers = soup.find_all('div', class_='srp-jobtuple-wrapper')
-        logger.info(f"[Tab: {driver.title[:50]}] Found {len(job_wrappers)} job cards (srp-jobtuple-wrapper)")
+        raw_count = len(job_wrappers)
+        logger.info(f"[Tab: {driver.title[:50]}] Found {raw_count} job cards (srp-jobtuple-wrapper)")
 
         if not job_wrappers:
             # Fallback: try the older cust-job-tuple class
             job_wrappers = soup.find_all('div', class_='cust-job-tuple')
-            logger.info(f"[Tab: {driver.title[:50]}] Found {len(job_wrappers)} job cards (cust-job-tuple fallback)")
+            raw_count = len(job_wrappers)
+            logger.info(f"[Tab: {driver.title[:50]}] Found {raw_count} job cards (cust-job-tuple fallback)")
 
         for job_wrapper in job_wrappers:
             # Find the title link - new selector is a.title (class="title ")
@@ -411,7 +416,11 @@ def collect_all_jobs_parallel(driver, search_urls):
             seen.add(link)
             unique_links.append(link)
 
-    logger.info(f"Total unique job links collected: {len(unique_links)}")
+    duplicate_count = len(all_links) - len(unique_links)
+    logger.info(
+        f"Collected {len(all_links)} eligible links from {len(window_handles)} tabs; "
+        f"removed {duplicate_count} duplicates; {len(unique_links)} unique jobs remain."
+    )
     return unique_links
 
 
@@ -424,12 +433,17 @@ def click_apply_button(driver, link):
 
     Returns True if applied successfully, False otherwise.
     """
-    # First, wait for the page to load
-    time.sleep(4)
+    # Do not sleep for a fixed page-load delay. External applications can be
+    # rejected as soon as their card/button is mounted.
+    time.sleep(0.2)
 
     current_host = driver.current_url.split('/')[2].lower() if '://' in driver.current_url else ''
     if REQUIRE_DIRECT_APPLY and not current_host.endswith('naukri.com'):
         logger.info(f"  Skipping non-Naukri page: {driver.current_url}")
+        return False
+
+    if page_has_company_site_apply(driver):
+        logger.info("  Skipping 'Apply on company site' application.")
         return False
 
     # Match only the exact direct-application label. Do not use contains()
@@ -442,7 +456,7 @@ def click_apply_button(driver, link):
 
     for by, selector in apply_selectors:
         try:
-            apply_btn = WebDriverWait(driver, 8).until(
+            apply_btn = WebDriverWait(driver, APPLY_DETECTION_TIMEOUT).until(
                 EC.element_to_be_clickable((by, selector))
             )
             if is_company_site_apply_button(apply_btn):
@@ -482,6 +496,21 @@ def is_company_site_apply_button(element):
         'external application',
         'external site',
     ))
+
+
+def page_has_company_site_apply(driver):
+    """Detect an external-application control without waiting through selectors."""
+    try:
+        controls = driver.find_elements(
+            By.CSS_SELECTOR,
+            "button, a, [role='button'], [class*='apply'], [class*='Apply']",
+        )
+        return any(
+            element.is_displayed() and is_company_site_apply_button(element)
+            for element in controls
+        )
+    except WebDriverException:
+        return False
 
 
 def visible_elements(driver, selector):
@@ -834,29 +863,31 @@ def question_for_scope(driver, scope):
 
 def complete_application_questions(driver, answers, resume, job_deadline=None):
     """Complete every visible application question; never treat partial work as success."""
-    deadline = time.time() + QUESTIONNAIRE_TIMEOUT
+    deadline = time.monotonic() + POST_TIMEOUT
     if job_deadline is not None:
         deadline = min(deadline, job_deadline)
     saw_questionnaire = False
     handled_control = False
     current_question = None
-    question_started = time.time()
-    while time.time() < deadline:
+    question_started = time.monotonic()
+    while time.monotonic() < deadline:
         scope = form_scope(driver)
         if scope is not driver:
             saw_questionnaire = True
         detected_question = question_for_scope(driver, scope)
         if detected_question and detected_question != current_question:
             current_question = detected_question
-            question_started = time.time()
-        if current_question and time.time() - question_started >= QUESTION_TIMEOUT:
-            logger.warning(f"  Question timed out after {QUESTION_TIMEOUT}s: {current_question}")
+            question_started = time.monotonic()
+        if current_question and time.monotonic() - question_started >= MANUAL_ANSWER_TIMEOUT:
+            logger.warning(
+                f"  Question timed out after {MANUAL_ANSWER_TIMEOUT}s: {current_question}"
+            )
             return False
         if has_application_confirmation(driver):
             return True
         if answer_visible_question(driver, scope, answers, resume):
             handled_control = True
-            time.sleep(1)
+            time.sleep(QUESTION_POLL_INTERVAL)
             continue
 
         # Do not click Save/Next while a visible form control is still
@@ -869,7 +900,7 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
         )
         if pending_controls:
             logger.info("  Waiting for the questionnaire input to become available.")
-            time.sleep(1)
+            time.sleep(QUESTION_POLL_INTERVAL)
             continue
 
         buttons = questionnaire_buttons(driver, scope)
@@ -889,7 +920,7 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
                 button.click()
             except WebDriverException:
                 driver.execute_script("arguments[0].click();", button)
-            time.sleep(2)
+            time.sleep(QUESTION_POLL_INTERVAL)
             continue
 
         labels = [control_label(item) for item in buttons if control_label(item)]
@@ -905,9 +936,9 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
                 return has_application_confirmation(driver)
         elif has_application_confirmation(driver):
             return True
-        time.sleep(1)
+        time.sleep(QUESTION_POLL_INTERVAL)
 
-    logger.warning("  Questionnaire timed out or still has unanswered fields.")
+    logger.warning(f"  Post timeout reached after {POST_TIMEOUT}s.")
     return False
 
 
@@ -929,7 +960,7 @@ def apply_to_jobs(driver, job_links, answers, resume):
             logger.info(f"Reached max application limit ({MAX_APPLICATIONS}). Stopping.")
             break
 
-        job_deadline = time.time() + JOB_TIMEOUT
+        job_deadline = time.monotonic() + POST_TIMEOUT
         logger.info(f"[{i}/{len(job_links)}] Visiting job: {link}")
         try:
             driver.get(link)
@@ -939,10 +970,10 @@ def apply_to_jobs(driver, job_links, answers, resume):
             applied_list['failed'].append(link)
             continue
 
-        if time.time() >= job_deadline:
+        if time.monotonic() >= job_deadline:
             failed += 1
             applied_list['failed'].append(link)
-            logger.warning(f"  ✗ Job timed out after {JOB_TIMEOUT}s before applying.")
+            logger.warning(f"  ✗ Job timed out after {POST_TIMEOUT}s before applying.")
             continue
 
         # --- Click the "Apply" button ---
@@ -954,8 +985,8 @@ def apply_to_jobs(driver, job_links, answers, resume):
             else:
                 failed += 1
                 applied_list['failed'].append(link)
-                if time.time() >= job_deadline:
-                    logger.warning(f"  ✗ Job timed out after {JOB_TIMEOUT}s; application was not confirmed.")
+                if time.monotonic() >= job_deadline:
+                    logger.warning(f"  ✗ Job timed out after {POST_TIMEOUT}s; application was not confirmed.")
                 else:
                     logger.warning("  ✗ Application was not confirmed; not marked as applied.")
                 continue

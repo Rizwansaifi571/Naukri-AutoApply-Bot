@@ -34,3 +34,4 @@ env/
 .venv/
 
 application_answers.csv
+naukri_recommended_attempted.json

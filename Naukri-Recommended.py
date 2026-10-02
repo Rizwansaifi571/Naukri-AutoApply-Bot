@@ -23,6 +23,7 @@ import os
 import time
 import csv
 import difflib
+import json
 import logging
 import re
 from datetime import datetime
@@ -48,8 +49,12 @@ load_dotenv()
 
 NAUKRI_EMAIL = os.getenv('NAUKRI_EMAIL', '')
 NAUKRI_PASSWORD = os.getenv('NAUKRI_PASSWORD', '')
-MAX_SELECT = 5
+MAX_SELECT = max(1, int(os.getenv('MAX_SELECT', '5')))
+POST_TIMEOUT = max(30, int(os.getenv('POST_TIMEOUT', '90')))
+QUESTION_POLL_INTERVAL = max(0.25, float(os.getenv('QUESTION_POLL_INTERVAL', '0.5')))
+MANUAL_ANSWER_TIMEOUT = max(10, int(os.getenv('MANUAL_ANSWER_TIMEOUT', '30')))
 ANSWERS_CSV = "application_answers.csv"
+ATTEMPTED_JOBS_FILE = os.getenv('ATTEMPTED_JOBS_FILE', 'naukri_recommended_attempted.json')
 
 TABS = [
     {"num": 1, "id": "apply",        "label": "Applies"},
@@ -68,6 +73,41 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+def load_attempted_jobs():
+    """Load recommendation keys already processed or skipped."""
+    try:
+        with open(ATTEMPTED_JOBS_FILE, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        return set(data) if isinstance(data, list) else set()
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def save_attempted_jobs(attempted):
+    """Persist processed recommendation keys so failed posts are not retried."""
+    try:
+        with open(ATTEMPTED_JOBS_FILE, 'w', encoding='utf-8') as file:
+            json.dump(sorted(attempted), file, indent=2)
+    except OSError as error:
+        logger.warning(f"Could not save attempted recommendations: {error}")
+
+
+def job_key(card):
+    """Return a stable key for a recommendation card."""
+    try:
+        links = card.find_elements(By.CSS_SELECTOR, "a[href]")
+        for link in links:
+            href = link.get_attribute('href') or ''
+            if 'naukri.com' in href and ('job-listings' in href or '/job/' in href):
+                return href.split('?')[0]
+    except Exception:
+        pass
+    try:
+        return card.find_element(By.CSS_SELECTOR, ".title.typ-16Bold").text.strip()
+    except NoSuchElementException:
+        return ''
 
 
 # ============================================================
@@ -120,6 +160,18 @@ def load_answers():
 
 def fuzzy_lookup(question_text, known_answers, threshold=0.72):
     """Return the stored answer for question_text, using fuzzy matching as fallback."""
+    def normalize(value):
+        value = value.lower().replace('lacs', 'lakhs').replace('lac', 'lakh')
+        return ' '.join(re.findall(r'[a-z0-9]+', value))
+
+    def meaningful_tokens(value):
+        ignored = {
+            'a', 'an', 'and', 'are', 'do', 'does', 'for', 'have', 'how',
+            'in', 'many', 'of', 'on', 'the', 'to', 'with', 'years', 'year',
+            'experience', 'current', 'please', 'mention', 'your', 'you',
+        }
+        return {token for token in normalize(value).split() if token not in ignored}
+
     def usable_answer(answer):
         normalized_question = question_text.lower()
         numeric_question = any(term in normalized_question for term in (
@@ -128,21 +180,29 @@ def fuzzy_lookup(question_text, known_answers, threshold=0.72):
         ))
         if numeric_question and answer.strip().lower() in ('yes', 'no', 'fresher'):
             return '0'
+        if 'ctc' in normalized_question or 'salary' in normalized_question:
+            try:
+                if float(re.sub(r'[^0-9.]', '', answer)) <= 0:
+                    return None
+            except ValueError:
+                return None
         return answer
 
     if question_text in known_answers:
         return usable_answer(known_answers[question_text])
-    def normalize(value):
-        value = value.lower().replace('lacs', 'lakhs').replace('lac', 'lakh')
-        return ' '.join(re.findall(r'[a-z0-9]+', value))
 
     normalized_question = normalize(question_text)
+    question_tokens = meaningful_tokens(question_text)
     normalized_answers = {normalize(key): key for key in known_answers}
-    matches = difflib.get_close_matches(
-        normalized_question, normalized_answers.keys(), n=1, cutoff=threshold
-    )
-    if matches:
-        matched_key = normalized_answers[matches[0]]
+    candidates = []
+    for normalized_key, original_key in normalized_answers.items():
+        if question_tokens and not question_tokens.intersection(meaningful_tokens(original_key)):
+            continue
+        score = difflib.SequenceMatcher(None, normalized_question, normalized_key).ratio()
+        if score >= threshold:
+            candidates.append((score, original_key))
+    if candidates:
+        _, matched_key = max(candidates, key=lambda item: item[0])
         logger.info(f"   ~ Fuzzy match: '{matched_key}' → using stored answer")
         return usable_answer(known_answers[matched_key])
     return None
@@ -217,7 +277,7 @@ def login_naukri(driver):
 # Step 1: Select jobs & click Apply
 # ============================================================
 
-def select_jobs_and_apply(driver):
+def select_jobs_and_apply(driver, attempted):
     """
     Select up to 5 jobs by clicking their checkboxes, then click Apply.
     Assumes we're already on the recommended jobs page.
@@ -232,20 +292,24 @@ def select_jobs_and_apply(driver):
         )
     except TimeoutException:
         logger.error("No job cards found.")
-        return False
+        return None
 
     job_cards = driver.find_elements(By.CSS_SELECTOR, "article.jobTuple")
     logger.info(f"Found {len(job_cards)} job cards.")
 
     if not job_cards:
         logger.warning("No recommended jobs available.")
-        return False
+        return None
 
     selected = 0
+    selected_keys = []
     for card in job_cards:
         if selected >= MAX_SELECT:
             break
         try:
+            key = job_key(card)
+            if not key or key in attempted:
+                continue
             if not card.find_elements(By.CSS_SELECTOR, ".tuple-check-box i"):
                 continue
 
@@ -260,6 +324,7 @@ def select_jobs_and_apply(driver):
             cb = card.find_element(By.CSS_SELECTOR, ".tuple-check-box i.naukicon, .tuple-check-box")
             driver.execute_script("arguments[0].click();", cb)
             selected += 1
+            selected_keys.append(key)
 
             try:
                 title = card.find_element(By.CSS_SELECTOR, ".title.typ-16Bold").text
@@ -272,7 +337,7 @@ def select_jobs_and_apply(driver):
 
     if selected == 0:
         logger.warning("No jobs were selected.")
-        return False
+        return None
 
     try:
         time.sleep(2)
@@ -281,23 +346,23 @@ def select_jobs_and_apply(driver):
         )
         if apply_btn.get_attribute('disabled') is not None:
             logger.warning("Apply button disabled after selection.")
-            return False
+            return None
 
         driver.execute_script("arguments[0].click();", apply_btn)
-        logger.info(f"✓ Clicked Apply for {selected} jobs!")
+        logger.info(f"✓ Clicked Apply for batch of {selected} jobs!")
         time.sleep(3)
-        return True
+        return selected_keys
 
     except (TimeoutException, ElementClickInterceptedException) as e:
         logger.error(f"Could not click Apply: {e}")
-        return False
+        return None
 
 
 # ============================================================
 # Step 2: Handle the Chatbot Drawer Questions
 # ============================================================
 
-def handle_chatbot_drawer(driver, known_answers):
+def handle_chatbot_drawer(driver, known_answers, deadline=None):
     """
     After clicking Apply, the chatbot drawer appears.
 
@@ -317,7 +382,7 @@ def handle_chatbot_drawer(driver, known_answers):
             EC.presence_of_element_located((By.CSS_SELECTOR, "[id*='ChatbotContainer'], .chatbot_Drawer"))
         )
         logger.info("Chatbot drawer appeared.")
-        time.sleep(3)
+        time.sleep(1)
     except TimeoutException:
         logger.info("No chatbot drawer. Application may be complete.")
         return True
@@ -325,8 +390,11 @@ def handle_chatbot_drawer(driver, known_answers):
     # Track the last known bot message count so we can detect new questions
     last_bot_msg_count = 0
 
-    for iteration in range(60):  # 60 * 2s = up to 2 min waiting
-        time.sleep(2)
+    for iteration in range(240):
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning("Post timeout reached while processing questionnaire.")
+            return False
+        time.sleep(QUESTION_POLL_INTERVAL)
 
         try:
             # If drawer closed, we're done
@@ -335,19 +403,32 @@ def handle_chatbot_drawer(driver, known_answers):
                 return True
 
             # --- 1. Radio buttons ---
-            if handle_radio_buttons(driver, known_answers):
+            if handle_radio_buttons(driver, known_answers, deadline):
                 continue
+            if any(
+                option.is_displayed()
+                for container in driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
+                )
+                for option in [container]
+            ):
+                logger.warning("Radio question did not complete; skipping this post.")
+                return False
 
             # --- 2. Contenteditable text field (chatbot free-text input) ---
-            if handle_contenteditable(driver, known_answers):
+            if handle_contenteditable(driver, known_answers, deadline):
                 continue
+            if find_chat_text_area(driver):
+                logger.warning("Text question did not complete; skipping this post.")
+                return False
 
             # --- 3. Save button ready? ---
             try:
                 save_btn = find_save_button(driver)
                 if save_btn and click_save_button(driver, save_btn):
                     logger.info("Save button ready. Clicking...")
-                    time.sleep(3)
+                    time.sleep(1)
                     continue
             except Exception:
                 pass
@@ -440,7 +521,7 @@ def _click_save_after_radio(driver):
 
 # ============================================================
 
-def handle_radio_buttons(driver, known_answers):
+def handle_radio_buttons(driver, known_answers, deadline=None):
     """
     Check for radio button question. If found:
       - Known answer → auto-click
@@ -477,7 +558,7 @@ def handle_radio_buttons(driver, known_answers):
                 if rb.get_attribute('value') == known or rb.get_attribute('id') == known:
                     driver.execute_script("arguments[0].click();", rb)
                     logger.info(f"   ✓ Auto-filled: '{known}'")
-                    time.sleep(1)
+                    time.sleep(0.25)
                     _click_save_after_radio(driver)
                     return True
             except Exception:
@@ -500,9 +581,11 @@ def handle_radio_buttons(driver, known_answers):
 
     # Wait for user to click one — re-fetch elements every iteration to avoid stale references
     waited = 0
-    while waited < 30:  # up to 60 seconds
-        time.sleep(2)
-        waited += 2
+    while waited < MANUAL_ANSWER_TIMEOUT:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(QUESTION_POLL_INTERVAL)
+        waited += QUESTION_POLL_INTERVAL
 
         # Check if container still exists
         try:
@@ -525,7 +608,7 @@ def handle_radio_buttons(driver, known_answers):
             radios, lbls = [], []
 
         if not radios:
-            if waited % 10 == 0:
+            if int(waited) % 10 == 0:
                 logger.info(f"   Waiting for radio options to load... ({waited}s)")
             continue
 
@@ -551,7 +634,7 @@ def handle_radio_buttons(driver, known_answers):
         except Exception:
             return True
 
-        if waited % 10 == 0:
+        if int(waited) % 10 == 0:
             logger.info(f"   Still waiting for you to click an option... ({waited}s)")
 
     logger.warning("   Timed out waiting for radio selection.")
@@ -562,7 +645,7 @@ def handle_radio_buttons(driver, known_answers):
 # Handler: Contenteditable (Chatbot Free-Text Input)
 # ============================================================
 
-def handle_contenteditable(driver, known_answers):
+def handle_contenteditable(driver, known_answers, deadline=None):
     """
     Check for the chatbot's free-text input (div[contenteditable="true"]).
     Known answer → auto-type and click save.
@@ -592,12 +675,12 @@ def handle_contenteditable(driver, known_answers):
                     arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
                 """, fresh_text_area, known)
                 logger.info(f"   ✓ Auto-filled: '{known}'")
-                time.sleep(0.5)
+                time.sleep(0.25)
                 try:
                     fresh_text_area.send_keys(Keys.RETURN)
                 except Exception:
                     pass
-                time.sleep(0.5)
+                time.sleep(0.25)
         except Exception as e:
             logger.warning(f"   Could not auto-fill text: {e}")
 
@@ -606,7 +689,7 @@ def handle_contenteditable(driver, known_answers):
             save_btn = find_save_button(driver)
             if save_btn and click_save_button(driver, save_btn):
                 logger.info("   Clicked Save after auto-fill.")
-                time.sleep(3)
+                time.sleep(1)
                 return True
         except Exception:
             pass
@@ -618,9 +701,11 @@ def handle_contenteditable(driver, known_answers):
     logger.info("   ✏️ Type your answer in the browser and click Send/Save...")
 
     waited = 0
-    while waited < 60:
-        time.sleep(2)
-        waited += 2
+    while waited < MANUAL_ANSWER_TIMEOUT:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(QUESTION_POLL_INTERVAL)
+        waited += QUESTION_POLL_INTERVAL
 
         try:
             # Did user submit an answer? (user message count increased)
@@ -630,7 +715,7 @@ def handle_contenteditable(driver, known_answers):
                 if answer:
                     logger.info(f"   ✓ User answered: '{answer}'")
                     save_answer(question_text, answer, "text")
-                    time.sleep(2)
+                    time.sleep(0.25)
                     return True
 
             if not is_drawer_open(driver):
@@ -641,7 +726,7 @@ def handle_contenteditable(driver, known_answers):
         except Exception:
             continue
 
-        if waited % 10 == 0:
+        if int(waited) % 10 == 0:
             logger.info(f"   Still waiting for you to type & send... ({waited}s)")
 
     logger.warning("   Timed out waiting for text answer.")
@@ -790,6 +875,7 @@ def main():
     logger.info(f"Applying to tabs: {', '.join(t['label'] for t in selected_tabs)}")
 
     known_answers = load_answers()
+    attempted_jobs = load_attempted_jobs()
     total_applied = 0
 
     driver = None
@@ -805,16 +891,31 @@ def main():
             while True:
                 navigate_to_tab(driver, tab['id'])
 
-                if not select_jobs_and_apply(driver):
+                selected_keys = select_jobs_and_apply(driver, attempted_jobs)
+                if not selected_keys:
                     logger.info(f"No more jobs in '{tab['label']}'.")
                     break
 
-                handle_chatbot_drawer(driver, known_answers)
-                total_applied += MAX_SELECT
+                # Mark the whole batch before opening the questionnaire. A failed
+                # batch must not be selected again after a refresh or on a later run.
+                attempted_jobs.update(selected_keys)
+                save_attempted_jobs(attempted_jobs)
+
+                post_deadline = time.monotonic() + POST_TIMEOUT
+                if handle_chatbot_drawer(driver, known_answers, post_deadline):
+                    total_applied += len(selected_keys)
+                    logger.info(
+                        f"✓ Batch completed for {len(selected_keys)} selected jobs."
+                    )
+                else:
+                    logger.warning(
+                        f"Skipping unfinished batch of {len(selected_keys)} jobs after "
+                        f"{POST_TIMEOUT}s; those posts will not be retried."
+                    )
                 known_answers = load_answers()
 
                 logger.info(f"Total applied so far: ~{total_applied}")
-                time.sleep(3)
+                time.sleep(1)
 
         logger.info("=" * 50)
         logger.info(f"✅ Complete! Applied to ~{total_applied} jobs total.")
