@@ -103,8 +103,8 @@ def load_answers():
                 logger.warning("No header found in CSV, recreating.")
                 return answers
 
-            # Re-read properly with DictReader
-            reader = csv.DictReader(lines)
+            # Ignore any pre-header lines before parsing the actual CSV.
+            reader = csv.DictReader(lines[header_idx:])
             for row in reader:
                 q = (row.get('question_text') or '').strip()
                 a = (row.get('answer') or '').strip()
@@ -120,14 +120,31 @@ def load_answers():
 
 def fuzzy_lookup(question_text, known_answers, threshold=0.72):
     """Return the stored answer for question_text, using fuzzy matching as fallback."""
+    def usable_answer(answer):
+        normalized_question = question_text.lower()
+        numeric_question = any(term in normalized_question for term in (
+            'how many years', 'years of experience', 'current ctc',
+            'ctc/month', 'salary per month',
+        ))
+        if numeric_question and answer.strip().lower() in ('yes', 'no', 'fresher'):
+            return '0'
+        return answer
+
     if question_text in known_answers:
-        return known_answers[question_text]
+        return usable_answer(known_answers[question_text])
+    def normalize(value):
+        value = value.lower().replace('lacs', 'lakhs').replace('lac', 'lakh')
+        return ' '.join(re.findall(r'[a-z0-9]+', value))
+
+    normalized_question = normalize(question_text)
+    normalized_answers = {normalize(key): key for key in known_answers}
     matches = difflib.get_close_matches(
-        question_text, known_answers.keys(), n=1, cutoff=threshold
+        normalized_question, normalized_answers.keys(), n=1, cutoff=threshold
     )
     if matches:
-        logger.info(f"   ~ Fuzzy match: '{matches[0]}' → using stored answer")
-        return known_answers[matches[0]]
+        matched_key = normalized_answers[matches[0]]
+        logger.info(f"   ~ Fuzzy match: '{matched_key}' → using stored answer")
+        return usable_answer(known_answers[matched_key])
     return None
 
 
@@ -430,18 +447,19 @@ def handle_radio_buttons(driver, known_answers):
       - Unknown answer → log it, wait for user to click in browser, then save
     """
     # Check if radio container exists and is visible (using fresh reference each time)
-    try:
-        container = driver.find_element(By.CSS_SELECTOR, ".singleselect-radiobutton-container")
-        if not container.is_displayed():
-            return False
-    except NoSuchElementException:
+    containers = driver.find_elements(
+        By.CSS_SELECTOR,
+        ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
+    )
+    container = next((item for item in containers if item.is_displayed()), None)
+    if container is None:
         return False
 
     question_text = get_latest_bot_question(driver) or "RadioQuestion"
 
     # Freshly fetch radios and labels each time they're needed (DOM may re-render)
-    radio_buttons = container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
-    labels = container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
+    radio_buttons = container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
+    labels = container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
 
     options = [rb.get_attribute('value') or lbl.text.strip()
                for rb, lbl in zip(radio_buttons, labels)]
@@ -452,8 +470,8 @@ def handle_radio_buttons(driver, known_answers):
     # KNOWN ANSWER → auto-fill (use fresh references)
     known = fuzzy_lookup(question_text, known_answers)
     if known:
-        radios = container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
-        lbls = container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
+        radios = container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
+        lbls = container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
         for rb in radios:
             try:
                 if rb.get_attribute('value') == known or rb.get_attribute('id') == known:
@@ -488,14 +506,21 @@ def handle_radio_buttons(driver, known_answers):
 
         # Check if container still exists
         try:
-            current_container = driver.find_element(By.CSS_SELECTOR, ".singleselect-radiobutton-container")
+            current_container = next(
+                item for item in driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
+                ) if item.is_displayed()
+            )
         except NoSuchElementException:
+            return False
+        except StopIteration:
             return False
 
         # Re-fetch radios & labels fresh every poll cycle to avoid stale references
         try:
-            radios = current_container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
-            lbls = current_container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
+            radios = current_container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
+            lbls = current_container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
         except Exception:
             radios, lbls = [], []
 
@@ -559,7 +584,11 @@ def handle_contenteditable(driver, known_answers):
                 driver.execute_script("""
                     arguments[0].focus();
                     arguments[0].innerText = arguments[1];
-                    arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+                    arguments[0].dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: arguments[1]
+                    }));
                     arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
                 """, fresh_text_area, known)
                 logger.info(f"   ✓ Auto-filled: '{known}'")
@@ -623,10 +652,15 @@ def click_save_button(driver, save_btn):
     """Click the save/send button, tolerating a missing 'send' ancestor."""
     try:
         parent = save_btn.find_element(By.XPATH, "./ancestor::*[contains(@class,'send')]")
-        if 'disabled' in (parent.get_attribute('class') or ''):
+        if ('disabled' in (parent.get_attribute('class') or '').lower()
+                or parent.get_attribute('aria-disabled') == 'true'):
             return False  # genuinely disabled
     except Exception:
         pass  # no such ancestor — try clicking anyway
+    if (save_btn.get_attribute('disabled') is not None
+            or save_btn.get_attribute('aria-disabled') == 'true'):
+        return False
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", save_btn)
     driver.execute_script("arguments[0].click();", save_btn)
     return True
 
@@ -642,7 +676,10 @@ def find_chat_text_area(driver):
             ".chatbot_SendMessageContainer .textArea[contenteditable='true'], "
             ".chatbot_InputContainer .textArea[contenteditable='true'], "
             "#userInput__g651km1xsInputBox, "
-            "div.textArea[contenteditable='true']"
+            "div.textArea[contenteditable='true'], "
+            ".chatbot_SendMessageContainer .textArea, "
+            ".chatbot_InputContainer .textArea, "
+            "div.textArea"
         )
         for el in elements:
             if el.is_displayed() and el.is_enabled():
@@ -658,17 +695,30 @@ def find_save_button(driver):
     Uses generic selectors since the IDs are dynamic.
     """
     try:
+        drawer_selectors = "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog']"
+        drawers = [element for element in driver.find_elements(By.CSS_SELECTOR, drawer_selectors)
+                   if element.is_displayed()]
+        roots = drawers or [driver]
         selectors = [
             ".sendMsg",
             ".sendMsgbtn_container .sendMsg",
             "[class*='sendMsg']",
             "div.sendMsg",
+            "button",
+            "[role='button']",
         ]
-        for sel in selectors:
-            els = driver.find_elements(By.CSS_SELECTOR, sel)
-            for el in els:
-                if el.is_displayed():
-                    return el
+        for root in roots:
+            for sel in selectors:
+                els = root.find_elements(By.CSS_SELECTOR, sel)
+                for el in els:
+                    label = ' '.join([
+                        el.text or '',
+                        el.get_attribute('aria-label') or '',
+                        el.get_attribute('title') or '',
+                        el.get_attribute('value') or '',
+                    ]).strip().lower()
+                    if el.is_displayed() and any(word in label for word in ('save', 'send', 'submit', 'apply')):
+                        return el
     except Exception:
         pass
     return None
@@ -717,7 +767,6 @@ def navigate_to_tab(driver, tab_id):
         tab_el = driver.find_element(By.CSS_SELECTOR, f"div#{tab_id} .tab-list-item")
         driver.execute_script("arguments[0].scrollIntoView(true);", tab_el)
         driver.execute_script("arguments[0].click();", tab_el)
-        logger.info(f"Switched to tab: {tab_id}")
         time.sleep(3)
     except Exception as e:
         logger.warning(f"Could not activate tab '{tab_id}': {e}")

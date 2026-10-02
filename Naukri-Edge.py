@@ -436,14 +436,23 @@ def click_apply_button(driver, link):
     # because it also matches "Apply on company site".
     apply_selectors = [
         (By.XPATH, "//button[normalize-space(.)='Apply']"),
+        (By.XPATH, "//*[@role='button' and normalize-space(.)='Apply']"),
+        (By.CSS_SELECTOR, "button[class*='apply'], [class*='apply-button']"),
     ]
 
     for by, selector in apply_selectors:
         try:
-            apply_btn = WebDriverWait(driver, 3).until(
+            apply_btn = WebDriverWait(driver, 8).until(
                 EC.element_to_be_clickable((by, selector))
             )
-            apply_btn.click()
+            if is_company_site_apply_button(apply_btn):
+                logger.info("  Skipping 'Apply on company site' application.")
+                return False
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", apply_btn)
+            try:
+                apply_btn.click()
+            except WebDriverException:
+                driver.execute_script("arguments[0].click();", apply_btn)
             time.sleep(1)
 
             # Direct applications stay on Naukri. Treat another destination
@@ -457,6 +466,22 @@ def click_apply_button(driver, link):
             continue
 
     return False
+
+
+def is_company_site_apply_button(element):
+    """Return True for buttons that start an external/company-site application."""
+    text = ' '.join((
+        element.text or '',
+        element.get_attribute('aria-label') or '',
+        element.get_attribute('title') or '',
+        element.get_attribute('href') or '',
+    )).strip().lower()
+    return any(marker in text for marker in (
+        'apply on company site',
+        'company site',
+        'external application',
+        'external site',
+    ))
 
 
 def visible_elements(driver, selector):
@@ -503,10 +528,38 @@ def select_option(driver, select_element, answer):
 
 def form_scope(driver):
     """Prefer the application drawer so unrelated job-page fields are untouched."""
-    selectors = "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog']"
-    for element in visible_elements(driver, selectors):
-        return element
-    return driver
+    selectors = (
+        "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog'], "
+        "[id^='chatList_'], ul[id*='chatList_'], .chatbot_List"
+    )
+    candidates = visible_elements(driver, selectors)
+    control_selector = (
+        "input:not([type='hidden']):not([type='submit']):not([type='button']), "
+        "textarea, select, [contenteditable='true'], [role='textbox']"
+    )
+    best_candidate = None
+    best_control_count = 0
+    for element in candidates:
+        if (element.get_attribute('id') or '').startswith('chatList_'):
+            try:
+                drawer = element.find_element(
+                    By.XPATH,
+                    "./ancestor::*[@role='dialog' or contains(@class, 'Drawer') or contains(@class, 'drawer')][1]",
+                )
+                if drawer.is_displayed():
+                    element = drawer
+            except (NoSuchElementException, WebDriverException):
+                pass
+        try:
+            control_count = len(element.find_elements(By.CSS_SELECTOR, control_selector))
+        except WebDriverException:
+            control_count = 0
+        if control_count > best_control_count:
+            best_candidate = element
+            best_control_count = control_count
+    if best_candidate is not None:
+        return best_candidate
+    return candidates[0] if candidates else driver
 
 
 def scope_elements(scope, selector):
@@ -519,8 +572,29 @@ def scope_elements(scope, selector):
 
 def questionnaire_buttons(driver, scope):
     """Find visible questionnaire controls, preferring controls inside the drawer."""
-    selector = "button, input[type='submit'], input[type='button'], [role='button']"
+    selector = (
+        "button:not([class*='save-job']):not([id*='save-job']), "
+        "input[type='submit'], input[type='button'], [role='button'], "
+        "[class*='sendMsg'], [class*='save'], div.sendMsg"
+    )
     scoped_buttons = scope_elements(scope, selector)
+    for label in ('Save', 'Send', 'Next', 'Continue', 'Submit', 'Apply'):
+        try:
+            scoped_buttons.extend(scope_elements(scope, f"div[aria-label='{label}']"))
+            scoped_buttons.extend(scope_elements(scope, f"div[title='{label}']"))
+        except WebDriverException:
+            pass
+    try:
+        scoped_buttons.extend(
+            element for element in scope.find_elements(
+                By.XPATH,
+                ".//*[normalize-space(.)='Save' or normalize-space(.)='Send' or "
+                "normalize-space(.)='Next' or normalize-space(.)='Continue' or "
+                "normalize-space(.)='Submit' or normalize-space(.)='Apply']",
+            ) if element.is_displayed() and element.is_enabled()
+        )
+    except WebDriverException:
+        pass
     if scope is not driver and scoped_buttons:
         return scoped_buttons
     buttons = list(reversed(scoped_buttons if scope is driver else visible_elements(driver, selector)))
@@ -542,9 +616,38 @@ def action_label(element):
     return re.sub(r'[^a-z ]', '', control_label(element).lower()).strip()
 
 
+def is_job_save_button(element):
+    """Exclude the job-card Save button from questionnaire actions."""
+    marker = ' '.join((
+        element.get_attribute('id') or '',
+        element.get_attribute('class') or '',
+        element.get_attribute('data-testid') or '',
+    )).lower()
+    return (
+        'styles_save-job-button' in marker
+        or marker.strip() in {'save-job', 'savejob'}
+    )
+
+
+def is_chatbot_element(element):
+    """Return whether an element belongs to Naukri's application chatbot."""
+    try:
+        element.find_element(
+            By.XPATH,
+            "ancestor-or-self::*[contains(@id, 'ChatbotContainer') or "
+            "contains(@class, 'chatbot_') or contains(@class, 'chatBot')][1]",
+        )
+        return True
+    except (NoSuchElementException, WebDriverException):
+        return False
+
+
 def latest_question_text(driver, scope):
     """Read the current chatbot question before falling back to control labels."""
-    selectors = ".chatbot_ListItem.botItem .msg, .chatbot_ListItem .botMsg .msg, [class*='botMsg']"
+    selectors = (
+        ".chatbot_ListItem.botItem .msg, .chatbot_ListItem .botMsg .msg, "
+        "[class*='botMsg'], #chatList_ li.botItem, ul[id*='chatList_'] li.botItem"
+    )
     messages = scope_elements(scope, selectors)
     for element in reversed(messages):
         text = element.text.strip()
@@ -578,7 +681,7 @@ def radio_group_key(radio):
 def answer_visible_question(driver, scope, answers, resume):
     """Answer one visible questionnaire control and return whether work was done."""
     radio_groups = {}
-    for radio in scope_elements(scope, "input[type='radio']"):
+    for radio in scope_elements(scope, "input[type='radio'], .ssrc__radio"):
         radio_groups.setdefault(radio_group_key(radio), []).append(radio)
     for radios in radio_groups.values():
         if any(radio.is_selected() for radio in radios):
@@ -619,25 +722,55 @@ def answer_visible_question(driver, scope, answers, resume):
 
     checkboxes = scope_elements(scope, "input[type='checkbox']")
     if checkboxes:
-        if any(checkbox.is_selected() for checkbox in checkboxes):
-            return False
         question = latest_question_text(driver, scope) or question_text_for(checkboxes[0])
         answer = get_question_answer(question, [], answers, resume)
         if not answer:
             logger.warning(f"  Missing answer for checkbox question: {question}")
             return False
         requested = {item.strip().lower() for item in answer.split(',')}
+        numeric_answer = None
+        try:
+            numeric_answer = float(answer.strip())
+        except ValueError:
+            pass
+        selected_numeric_option = False
         for checkbox in checkboxes:
             checkbox_id = checkbox.get_attribute('id')
             labels = scope.find_elements(By.CSS_SELECTOR, f"label[for='{checkbox_id}']") if checkbox_id else []
-            option = (labels[0].text.strip() if labels else checkbox.get_attribute('value') or '').lower()
-            should_be_checked = option in requested or answer.strip().lower() in ('yes', 'true', 'on', 'checked')
+            option = (labels[0].text.strip() if labels else checkbox.get_attribute('value') or '')
+            normalized_option = option.lower()
+            should_be_checked = (
+                normalized_option in requested
+                or answer.strip().lower() in ('yes', 'true', 'on', 'checked')
+            )
+            if numeric_answer is not None:
+                bounds = re.findall(r'\d+(?:\.\d+)?', normalized_option)
+                if bounds:
+                    lower_bound = float(bounds[0])
+                    upper_bound = float(bounds[1]) if len(bounds) > 1 else lower_bound
+                    if '>' in normalized_option:
+                        should_be_checked = numeric_answer > lower_bound
+                    else:
+                        should_be_checked = lower_bound <= numeric_answer <= upper_bound
+                    selected_numeric_option = selected_numeric_option or should_be_checked
             if checkbox.is_selected() != should_be_checked:
                 driver.execute_script("arguments[0].click();", checkbox)
+                if checkbox.is_selected() != should_be_checked and labels:
+                    driver.execute_script("arguments[0].click();", labels[0])
+                if checkbox.is_selected() != should_be_checked:
+                    logger.warning(f"  Could not select checkbox option '{option}' for: {question}")
+                    return False
+        if numeric_answer is not None and not selected_numeric_option:
+            logger.warning(f"  No checkbox range matched numeric answer '{answer}' for: {question}")
+            return False
         save_answer(question, answer, 'checkbox')
         return True
 
-    fields = scope_elements(scope, "input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='submit']), textarea, div[contenteditable='true']")
+    fields = scope_elements(
+        scope,
+        "input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='submit']), "
+        "textarea, div[contenteditable='true'], div.textArea, [role='textbox']",
+    )
     for field in fields:
         if field.get_attribute('readonly') or field.get_attribute('disabled'):
             continue
@@ -705,6 +838,7 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
     if job_deadline is not None:
         deadline = min(deadline, job_deadline)
     saw_questionnaire = False
+    handled_control = False
     current_question = None
     question_started = time.time()
     while time.time() < deadline:
@@ -721,6 +855,20 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
         if has_application_confirmation(driver):
             return True
         if answer_visible_question(driver, scope, answers, resume):
+            handled_control = True
+            time.sleep(1)
+            continue
+
+        # Do not click Save/Next while a visible form control is still
+        # unanswered. This prevents the drawer from looping on Save when
+        # Naukri renders the input outside its message-list container.
+        pending_controls = scope_elements(
+            scope,
+            "input:not([type='hidden']):not([type='radio']):not([type='checkbox']):not([type='submit']), "
+            "textarea, select, div[contenteditable='true'], div.textArea, [role='textbox']",
+        )
+        if pending_controls:
+            logger.info("  Waiting for the questionnaire input to become available.")
             time.sleep(1)
             continue
 
@@ -728,8 +876,13 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
         action_labels = {
             'next', 'continue', 'save', 'send', 'submit', 'submit and apply', 'apply',
         }
-        button = next((item for item in buttons if action_label(item) in action_labels), None)
-        if button:
+        button = next((
+            item for item in buttons
+            if is_chatbot_element(item)
+            and not is_job_save_button(item)
+            and action_label(item) in action_labels
+        ), None)
+        if button and (handled_control or not current_question):
             label = control_label(button)
             logger.info(f"  Clicking questionnaire action: {label}")
             try:
@@ -744,7 +897,11 @@ def complete_application_questions(driver, answers, resume, job_deadline=None):
             logger.warning(f"  No recognized questionnaire action. Visible controls: {labels}")
 
         if saw_questionnaire:
-            if not visible_elements(driver, "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog']"):
+            if not visible_elements(
+                driver,
+                "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog'], "
+                "[id^='chatList_'], ul[id*='chatList_'], .chatbot_List",
+            ):
                 return has_application_confirmation(driver)
         elif has_application_confirmation(driver):
             return True
