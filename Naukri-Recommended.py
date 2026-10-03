@@ -23,7 +23,6 @@ import os
 import time
 import csv
 import difflib
-import json
 import logging
 import re
 from datetime import datetime
@@ -49,12 +48,8 @@ load_dotenv()
 
 NAUKRI_EMAIL = os.getenv('NAUKRI_EMAIL', '')
 NAUKRI_PASSWORD = os.getenv('NAUKRI_PASSWORD', '')
-MAX_SELECT = max(1, int(os.getenv('MAX_SELECT', '5')))
-POST_TIMEOUT = max(30, int(os.getenv('POST_TIMEOUT', '90')))
-QUESTION_POLL_INTERVAL = max(0.25, float(os.getenv('QUESTION_POLL_INTERVAL', '0.5')))
-MANUAL_ANSWER_TIMEOUT = max(10, int(os.getenv('MANUAL_ANSWER_TIMEOUT', '30')))
+MAX_SELECT = 5
 ANSWERS_CSV = "application_answers.csv"
-ATTEMPTED_JOBS_FILE = os.getenv('ATTEMPTED_JOBS_FILE', 'naukri_recommended_attempted.json')
 
 TABS = [
     {"num": 1, "id": "apply",        "label": "Applies"},
@@ -73,41 +68,6 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-
-
-def load_attempted_jobs():
-    """Load recommendation keys already processed or skipped."""
-    try:
-        with open(ATTEMPTED_JOBS_FILE, 'r', encoding='utf-8') as file:
-            data = json.load(file)
-        return set(data) if isinstance(data, list) else set()
-    except (OSError, json.JSONDecodeError):
-        return set()
-
-
-def save_attempted_jobs(attempted):
-    """Persist processed recommendation keys so failed posts are not retried."""
-    try:
-        with open(ATTEMPTED_JOBS_FILE, 'w', encoding='utf-8') as file:
-            json.dump(sorted(attempted), file, indent=2)
-    except OSError as error:
-        logger.warning(f"Could not save attempted recommendations: {error}")
-
-
-def job_key(card):
-    """Return a stable key for a recommendation card."""
-    try:
-        links = card.find_elements(By.CSS_SELECTOR, "a[href]")
-        for link in links:
-            href = link.get_attribute('href') or ''
-            if 'naukri.com' in href and ('job-listings' in href or '/job/' in href):
-                return href.split('?')[0]
-    except Exception:
-        pass
-    try:
-        return card.find_element(By.CSS_SELECTOR, ".title.typ-16Bold").text.strip()
-    except NoSuchElementException:
-        return ''
 
 
 # ============================================================
@@ -143,8 +103,8 @@ def load_answers():
                 logger.warning("No header found in CSV, recreating.")
                 return answers
 
-            # Ignore any pre-header lines before parsing the actual CSV.
-            reader = csv.DictReader(lines[header_idx:])
+            # Re-read properly with DictReader
+            reader = csv.DictReader(lines)
             for row in reader:
                 q = (row.get('question_text') or '').strip()
                 a = (row.get('answer') or '').strip()
@@ -160,51 +120,14 @@ def load_answers():
 
 def fuzzy_lookup(question_text, known_answers, threshold=0.72):
     """Return the stored answer for question_text, using fuzzy matching as fallback."""
-    def normalize(value):
-        value = value.lower().replace('lacs', 'lakhs').replace('lac', 'lakh')
-        return ' '.join(re.findall(r'[a-z0-9]+', value))
-
-    def meaningful_tokens(value):
-        ignored = {
-            'a', 'an', 'and', 'are', 'do', 'does', 'for', 'have', 'how',
-            'in', 'many', 'of', 'on', 'the', 'to', 'with', 'years', 'year',
-            'experience', 'current', 'please', 'mention', 'your', 'you',
-        }
-        return {token for token in normalize(value).split() if token not in ignored}
-
-    def usable_answer(answer):
-        normalized_question = question_text.lower()
-        numeric_question = any(term in normalized_question for term in (
-            'how many years', 'years of experience', 'current ctc',
-            'ctc/month', 'salary per month',
-        ))
-        if numeric_question and answer.strip().lower() in ('yes', 'no', 'fresher'):
-            return '0'
-        if 'ctc' in normalized_question or 'salary' in normalized_question:
-            try:
-                if float(re.sub(r'[^0-9.]', '', answer)) <= 0:
-                    return None
-            except ValueError:
-                return None
-        return answer
-
     if question_text in known_answers:
-        return usable_answer(known_answers[question_text])
-
-    normalized_question = normalize(question_text)
-    question_tokens = meaningful_tokens(question_text)
-    normalized_answers = {normalize(key): key for key in known_answers}
-    candidates = []
-    for normalized_key, original_key in normalized_answers.items():
-        if question_tokens and not question_tokens.intersection(meaningful_tokens(original_key)):
-            continue
-        score = difflib.SequenceMatcher(None, normalized_question, normalized_key).ratio()
-        if score >= threshold:
-            candidates.append((score, original_key))
-    if candidates:
-        _, matched_key = max(candidates, key=lambda item: item[0])
-        logger.info(f"   ~ Fuzzy match: '{matched_key}' → using stored answer")
-        return usable_answer(known_answers[matched_key])
+        return known_answers[question_text]
+    matches = difflib.get_close_matches(
+        question_text, known_answers.keys(), n=1, cutoff=threshold
+    )
+    if matches:
+        logger.info(f"   ~ Fuzzy match: '{matches[0]}' → using stored answer")
+        return known_answers[matches[0]]
     return None
 
 
@@ -277,7 +200,7 @@ def login_naukri(driver):
 # Step 1: Select jobs & click Apply
 # ============================================================
 
-def select_jobs_and_apply(driver, attempted):
+def select_jobs_and_apply(driver):
     """
     Select up to 5 jobs by clicking their checkboxes, then click Apply.
     Assumes we're already on the recommended jobs page.
@@ -292,24 +215,20 @@ def select_jobs_and_apply(driver, attempted):
         )
     except TimeoutException:
         logger.error("No job cards found.")
-        return None
+        return False
 
     job_cards = driver.find_elements(By.CSS_SELECTOR, "article.jobTuple")
     logger.info(f"Found {len(job_cards)} job cards.")
 
     if not job_cards:
         logger.warning("No recommended jobs available.")
-        return None
+        return False
 
     selected = 0
-    selected_keys = []
     for card in job_cards:
         if selected >= MAX_SELECT:
             break
         try:
-            key = job_key(card)
-            if not key or key in attempted:
-                continue
             if not card.find_elements(By.CSS_SELECTOR, ".tuple-check-box i"):
                 continue
 
@@ -324,7 +243,6 @@ def select_jobs_and_apply(driver, attempted):
             cb = card.find_element(By.CSS_SELECTOR, ".tuple-check-box i.naukicon, .tuple-check-box")
             driver.execute_script("arguments[0].click();", cb)
             selected += 1
-            selected_keys.append(key)
 
             try:
                 title = card.find_element(By.CSS_SELECTOR, ".title.typ-16Bold").text
@@ -337,7 +255,7 @@ def select_jobs_and_apply(driver, attempted):
 
     if selected == 0:
         logger.warning("No jobs were selected.")
-        return None
+        return False
 
     try:
         time.sleep(2)
@@ -346,23 +264,23 @@ def select_jobs_and_apply(driver, attempted):
         )
         if apply_btn.get_attribute('disabled') is not None:
             logger.warning("Apply button disabled after selection.")
-            return None
+            return False
 
         driver.execute_script("arguments[0].click();", apply_btn)
-        logger.info(f"✓ Clicked Apply for batch of {selected} jobs!")
+        logger.info(f"✓ Clicked Apply for {selected} jobs!")
         time.sleep(3)
-        return selected_keys
+        return True
 
     except (TimeoutException, ElementClickInterceptedException) as e:
         logger.error(f"Could not click Apply: {e}")
-        return None
+        return False
 
 
 # ============================================================
 # Step 2: Handle the Chatbot Drawer Questions
 # ============================================================
 
-def handle_chatbot_drawer(driver, known_answers, deadline=None):
+def handle_chatbot_drawer(driver, known_answers):
     """
     After clicking Apply, the chatbot drawer appears.
 
@@ -382,7 +300,7 @@ def handle_chatbot_drawer(driver, known_answers, deadline=None):
             EC.presence_of_element_located((By.CSS_SELECTOR, "[id*='ChatbotContainer'], .chatbot_Drawer"))
         )
         logger.info("Chatbot drawer appeared.")
-        time.sleep(1)
+        time.sleep(3)
     except TimeoutException:
         logger.info("No chatbot drawer. Application may be complete.")
         return True
@@ -390,11 +308,8 @@ def handle_chatbot_drawer(driver, known_answers, deadline=None):
     # Track the last known bot message count so we can detect new questions
     last_bot_msg_count = 0
 
-    for iteration in range(240):
-        if deadline is not None and time.monotonic() >= deadline:
-            logger.warning("Post timeout reached while processing questionnaire.")
-            return False
-        time.sleep(QUESTION_POLL_INTERVAL)
+    for iteration in range(60):  # 60 * 2s = up to 2 min waiting
+        time.sleep(2)
 
         try:
             # If drawer closed, we're done
@@ -403,32 +318,19 @@ def handle_chatbot_drawer(driver, known_answers, deadline=None):
                 return True
 
             # --- 1. Radio buttons ---
-            if handle_radio_buttons(driver, known_answers, deadline):
+            if handle_radio_buttons(driver, known_answers):
                 continue
-            if any(
-                option.is_displayed()
-                for container in driver.find_elements(
-                    By.CSS_SELECTOR,
-                    ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
-                )
-                for option in [container]
-            ):
-                logger.warning("Radio question did not complete; skipping this post.")
-                return False
 
             # --- 2. Contenteditable text field (chatbot free-text input) ---
-            if handle_contenteditable(driver, known_answers, deadline):
+            if handle_contenteditable(driver, known_answers):
                 continue
-            if find_chat_text_area(driver):
-                logger.warning("Text question did not complete; skipping this post.")
-                return False
 
             # --- 3. Save button ready? ---
             try:
                 save_btn = find_save_button(driver)
                 if save_btn and click_save_button(driver, save_btn):
                     logger.info("Save button ready. Clicking...")
-                    time.sleep(1)
+                    time.sleep(3)
                     continue
             except Exception:
                 pass
@@ -521,26 +423,25 @@ def _click_save_after_radio(driver):
 
 # ============================================================
 
-def handle_radio_buttons(driver, known_answers, deadline=None):
+def handle_radio_buttons(driver, known_answers):
     """
     Check for radio button question. If found:
       - Known answer → auto-click
       - Unknown answer → log it, wait for user to click in browser, then save
     """
     # Check if radio container exists and is visible (using fresh reference each time)
-    containers = driver.find_elements(
-        By.CSS_SELECTOR,
-        ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
-    )
-    container = next((item for item in containers if item.is_displayed()), None)
-    if container is None:
+    try:
+        container = driver.find_element(By.CSS_SELECTOR, ".singleselect-radiobutton-container")
+        if not container.is_displayed():
+            return False
+    except NoSuchElementException:
         return False
 
     question_text = get_latest_bot_question(driver) or "RadioQuestion"
 
     # Freshly fetch radios and labels each time they're needed (DOM may re-render)
-    radio_buttons = container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
-    labels = container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
+    radio_buttons = container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
+    labels = container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
 
     options = [rb.get_attribute('value') or lbl.text.strip()
                for rb, lbl in zip(radio_buttons, labels)]
@@ -551,14 +452,14 @@ def handle_radio_buttons(driver, known_answers, deadline=None):
     # KNOWN ANSWER → auto-fill (use fresh references)
     known = fuzzy_lookup(question_text, known_answers)
     if known:
-        radios = container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
-        lbls = container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
+        radios = container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
+        lbls = container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
         for rb in radios:
             try:
                 if rb.get_attribute('value') == known or rb.get_attribute('id') == known:
                     driver.execute_script("arguments[0].click();", rb)
                     logger.info(f"   ✓ Auto-filled: '{known}'")
-                    time.sleep(0.25)
+                    time.sleep(1)
                     _click_save_after_radio(driver)
                     return True
             except Exception:
@@ -581,34 +482,25 @@ def handle_radio_buttons(driver, known_answers, deadline=None):
 
     # Wait for user to click one — re-fetch elements every iteration to avoid stale references
     waited = 0
-    while waited < MANUAL_ANSWER_TIMEOUT:
-        if deadline is not None and time.monotonic() >= deadline:
-            return False
-        time.sleep(QUESTION_POLL_INTERVAL)
-        waited += QUESTION_POLL_INTERVAL
+    while waited < 30:  # up to 60 seconds
+        time.sleep(2)
+        waited += 2
 
         # Check if container still exists
         try:
-            current_container = next(
-                item for item in driver.find_elements(
-                    By.CSS_SELECTOR,
-                    ".singleselect-radiobutton-container, .ssrc__radio-btn-container",
-                ) if item.is_displayed()
-            )
+            current_container = driver.find_element(By.CSS_SELECTOR, ".singleselect-radiobutton-container")
         except NoSuchElementException:
-            return False
-        except StopIteration:
             return False
 
         # Re-fetch radios & labels fresh every poll cycle to avoid stale references
         try:
-            radios = current_container.find_elements(By.CSS_SELECTOR, "input[type='radio'], .ssrc__radio")
-            lbls = current_container.find_elements(By.CSS_SELECTOR, "label, .ssrc__label")
+            radios = current_container.find_elements(By.CSS_SELECTOR, ".ssrc__radio")
+            lbls = current_container.find_elements(By.CSS_SELECTOR, ".ssrc__label")
         except Exception:
             radios, lbls = [], []
 
         if not radios:
-            if int(waited) % 10 == 0:
+            if waited % 10 == 0:
                 logger.info(f"   Waiting for radio options to load... ({waited}s)")
             continue
 
@@ -634,7 +526,7 @@ def handle_radio_buttons(driver, known_answers, deadline=None):
         except Exception:
             return True
 
-        if int(waited) % 10 == 0:
+        if waited % 10 == 0:
             logger.info(f"   Still waiting for you to click an option... ({waited}s)")
 
     logger.warning("   Timed out waiting for radio selection.")
@@ -645,7 +537,7 @@ def handle_radio_buttons(driver, known_answers, deadline=None):
 # Handler: Contenteditable (Chatbot Free-Text Input)
 # ============================================================
 
-def handle_contenteditable(driver, known_answers, deadline=None):
+def handle_contenteditable(driver, known_answers):
     """
     Check for the chatbot's free-text input (div[contenteditable="true"]).
     Known answer → auto-type and click save.
@@ -667,20 +559,16 @@ def handle_contenteditable(driver, known_answers, deadline=None):
                 driver.execute_script("""
                     arguments[0].focus();
                     arguments[0].innerText = arguments[1];
-                    arguments[0].dispatchEvent(new InputEvent('input', {
-                        bubbles: true,
-                        inputType: 'insertText',
-                        data: arguments[1]
-                    }));
+                    arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
                     arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
                 """, fresh_text_area, known)
                 logger.info(f"   ✓ Auto-filled: '{known}'")
-                time.sleep(0.25)
+                time.sleep(0.5)
                 try:
                     fresh_text_area.send_keys(Keys.RETURN)
                 except Exception:
                     pass
-                time.sleep(0.25)
+                time.sleep(0.5)
         except Exception as e:
             logger.warning(f"   Could not auto-fill text: {e}")
 
@@ -689,7 +577,7 @@ def handle_contenteditable(driver, known_answers, deadline=None):
             save_btn = find_save_button(driver)
             if save_btn and click_save_button(driver, save_btn):
                 logger.info("   Clicked Save after auto-fill.")
-                time.sleep(1)
+                time.sleep(3)
                 return True
         except Exception:
             pass
@@ -701,11 +589,9 @@ def handle_contenteditable(driver, known_answers, deadline=None):
     logger.info("   ✏️ Type your answer in the browser and click Send/Save...")
 
     waited = 0
-    while waited < MANUAL_ANSWER_TIMEOUT:
-        if deadline is not None and time.monotonic() >= deadline:
-            return False
-        time.sleep(QUESTION_POLL_INTERVAL)
-        waited += QUESTION_POLL_INTERVAL
+    while waited < 60:
+        time.sleep(2)
+        waited += 2
 
         try:
             # Did user submit an answer? (user message count increased)
@@ -715,7 +601,7 @@ def handle_contenteditable(driver, known_answers, deadline=None):
                 if answer:
                     logger.info(f"   ✓ User answered: '{answer}'")
                     save_answer(question_text, answer, "text")
-                    time.sleep(0.25)
+                    time.sleep(2)
                     return True
 
             if not is_drawer_open(driver):
@@ -726,7 +612,7 @@ def handle_contenteditable(driver, known_answers, deadline=None):
         except Exception:
             continue
 
-        if int(waited) % 10 == 0:
+        if waited % 10 == 0:
             logger.info(f"   Still waiting for you to type & send... ({waited}s)")
 
     logger.warning("   Timed out waiting for text answer.")
@@ -737,15 +623,10 @@ def click_save_button(driver, save_btn):
     """Click the save/send button, tolerating a missing 'send' ancestor."""
     try:
         parent = save_btn.find_element(By.XPATH, "./ancestor::*[contains(@class,'send')]")
-        if ('disabled' in (parent.get_attribute('class') or '').lower()
-                or parent.get_attribute('aria-disabled') == 'true'):
+        if 'disabled' in (parent.get_attribute('class') or ''):
             return False  # genuinely disabled
     except Exception:
         pass  # no such ancestor — try clicking anyway
-    if (save_btn.get_attribute('disabled') is not None
-            or save_btn.get_attribute('aria-disabled') == 'true'):
-        return False
-    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", save_btn)
     driver.execute_script("arguments[0].click();", save_btn)
     return True
 
@@ -761,10 +642,7 @@ def find_chat_text_area(driver):
             ".chatbot_SendMessageContainer .textArea[contenteditable='true'], "
             ".chatbot_InputContainer .textArea[contenteditable='true'], "
             "#userInput__g651km1xsInputBox, "
-            "div.textArea[contenteditable='true'], "
-            ".chatbot_SendMessageContainer .textArea, "
-            ".chatbot_InputContainer .textArea, "
-            "div.textArea"
+            "div.textArea[contenteditable='true']"
         )
         for el in elements:
             if el.is_displayed() and el.is_enabled():
@@ -780,30 +658,17 @@ def find_save_button(driver):
     Uses generic selectors since the IDs are dynamic.
     """
     try:
-        drawer_selectors = "[id*='ChatbotContainer'], .chatbot_Drawer, [role='dialog']"
-        drawers = [element for element in driver.find_elements(By.CSS_SELECTOR, drawer_selectors)
-                   if element.is_displayed()]
-        roots = drawers or [driver]
         selectors = [
             ".sendMsg",
             ".sendMsgbtn_container .sendMsg",
             "[class*='sendMsg']",
             "div.sendMsg",
-            "button",
-            "[role='button']",
         ]
-        for root in roots:
-            for sel in selectors:
-                els = root.find_elements(By.CSS_SELECTOR, sel)
-                for el in els:
-                    label = ' '.join([
-                        el.text or '',
-                        el.get_attribute('aria-label') or '',
-                        el.get_attribute('title') or '',
-                        el.get_attribute('value') or '',
-                    ]).strip().lower()
-                    if el.is_displayed() and any(word in label for word in ('save', 'send', 'submit', 'apply')):
-                        return el
+        for sel in selectors:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                if el.is_displayed():
+                    return el
     except Exception:
         pass
     return None
@@ -852,6 +717,7 @@ def navigate_to_tab(driver, tab_id):
         tab_el = driver.find_element(By.CSS_SELECTOR, f"div#{tab_id} .tab-list-item")
         driver.execute_script("arguments[0].scrollIntoView(true);", tab_el)
         driver.execute_script("arguments[0].click();", tab_el)
+        logger.info(f"Switched to tab: {tab_id}")
         time.sleep(3)
     except Exception as e:
         logger.warning(f"Could not activate tab '{tab_id}': {e}")
@@ -875,7 +741,6 @@ def main():
     logger.info(f"Applying to tabs: {', '.join(t['label'] for t in selected_tabs)}")
 
     known_answers = load_answers()
-    attempted_jobs = load_attempted_jobs()
     total_applied = 0
 
     driver = None
@@ -891,31 +756,16 @@ def main():
             while True:
                 navigate_to_tab(driver, tab['id'])
 
-                selected_keys = select_jobs_and_apply(driver, attempted_jobs)
-                if not selected_keys:
+                if not select_jobs_and_apply(driver):
                     logger.info(f"No more jobs in '{tab['label']}'.")
                     break
 
-                # Mark the whole batch before opening the questionnaire. A failed
-                # batch must not be selected again after a refresh or on a later run.
-                attempted_jobs.update(selected_keys)
-                save_attempted_jobs(attempted_jobs)
-
-                post_deadline = time.monotonic() + POST_TIMEOUT
-                if handle_chatbot_drawer(driver, known_answers, post_deadline):
-                    total_applied += len(selected_keys)
-                    logger.info(
-                        f"✓ Batch completed for {len(selected_keys)} selected jobs."
-                    )
-                else:
-                    logger.warning(
-                        f"Skipping unfinished batch of {len(selected_keys)} jobs after "
-                        f"{POST_TIMEOUT}s; those posts will not be retried."
-                    )
+                handle_chatbot_drawer(driver, known_answers)
+                total_applied += MAX_SELECT
                 known_answers = load_answers()
 
                 logger.info(f"Total applied so far: ~{total_applied}")
-                time.sleep(1)
+                time.sleep(3)
 
         logger.info("=" * 50)
         logger.info(f"✅ Complete! Applied to ~{total_applied} jobs total.")
