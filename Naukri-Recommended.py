@@ -25,6 +25,7 @@ import csv
 import difflib
 import logging
 import re
+from collections import Counter
 from datetime import datetime
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -108,6 +109,10 @@ def load_answers():
             for row in reader:
                 q = (row.get('question_text') or '').strip()
                 a = (row.get('answer') or '').strip()
+                # Ignore repeated headers that may be present after a
+                # self-learning append.
+                if q.lower() == 'question_text' and a.lower() == 'answer':
+                    continue
                 if q and a:
                     answers[q] = a
 
@@ -118,16 +123,103 @@ def load_answers():
     return answers
 
 
+_QUESTION_STOP_WORDS = {
+    'a', 'an', 'and', 'are', 'as', 'at', 'do', 'does', 'for', 'from',
+    'have', 'how', 'in', 'is', 'many', 'much', 'of', 'on', 'the', 'to',
+    'with', 'you', 'your', 'currently', 'work',
+}
+_GENERIC_QUESTION_TOKENS = {
+    'experience', 'year', 'years', 'month', 'months', 'number', 'duration',
+    'knowledge', 'proficiency', 'skill', 'skills', 'rate', 'rating',
+    'work', 'currently', 'current', 'total', 'relevant',
+}
+
+
+def _question_intent(question_text):
+    """Classify the answer shape so Yes/No cannot answer a numeric question."""
+    text = question_text.lower()
+    if re.search(r'\b(how many|number of|years?|months?|duration)\b', text):
+        return 'numeric'
+    if re.search(r'\b(rate|rating|proficien|scale|out of)\b', text):
+        return 'rating'
+    if re.search(r'\b(do you|have you|are you|can you|willing|require)\b', text):
+        return 'boolean'
+    return 'text'
+
+
+def _question_tokens(question_text):
+    """Create stable concept tokens from common questionnaire wording."""
+    text = question_text.lower()
+    text = re.sub(r'\b(yrs?|yr|exp)\b', 'experience', text)
+    text = re.sub(r'\byears?\s+of\s+work\s+experience\b', 'experience', text)
+    text = re.sub(r'\b(node\s*js|nodejs)\b', 'nodejs', text)
+    text = re.sub(r'\b(java\s*script)\b', 'javascript', text)
+    text = re.sub(r'\b(type\s*script)\b', 'typescript', text)
+    text = re.sub(r'\b(c\s*\+\s*\+)\b', 'cpp', text)
+    text = re.sub(r'\b(ai|a\.i\.)\b', 'artificial intelligence', text)
+    text = re.sub(r'[^a-z0-9+#]+', ' ', text)
+    tokens = [
+        token for token in text.split()
+        if token not in _QUESTION_STOP_WORDS and len(token) > 1
+    ]
+    return Counter(tokens)
+
+
+def _question_similarity(left, right):
+    """Score shared concepts, preserving distinctive skills such as Python."""
+    left_tokens = _question_tokens(left)
+    right_tokens = _question_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    shared = sum((left_tokens & right_tokens).values())
+    return (2 * shared) / (sum(left_tokens.values()) + sum(right_tokens.values()))
+
+
+def _distinctive_question_tokens(question_text):
+    """Return likely subject/skill tokens, excluding questionnaire boilerplate."""
+    return set(_question_tokens(question_text)) - _GENERIC_QUESTION_TOKENS
+
+
 def fuzzy_lookup(question_text, known_answers, threshold=0.72):
-    """Return the stored answer for question_text, using fuzzy matching as fallback."""
+    """
+    Return a stored answer for equivalent wording.
+
+    Matching is intent-aware: a numeric years/months question only matches
+    another numeric question, and skill tokens must overlap. This prevents
+    answers such as "Yes" for "How many years of Python experience?".
+    """
     if question_text in known_answers:
         return known_answers[question_text]
-    matches = difflib.get_close_matches(
-        question_text, known_answers.keys(), n=1, cutoff=threshold
-    )
-    if matches:
-        logger.info(f"   ~ Fuzzy match: '{matches[0]}' → using stored answer")
-        return known_answers[matches[0]]
+
+    query_intent = _question_intent(question_text)
+    candidates = []
+    for known_question, answer in known_answers.items():
+        if _question_intent(known_question) != query_intent:
+            continue
+        query_subjects = _distinctive_question_tokens(question_text)
+        known_subjects = _distinctive_question_tokens(known_question)
+        # If both questions identify a subject, it must be the same subject.
+        # This blocks Python from matching OpenTelemetry or Node.js.
+        if query_subjects and known_subjects and not query_subjects.intersection(known_subjects):
+            continue
+        concept_score = _question_similarity(question_text, known_question)
+        text_score = difflib.SequenceMatcher(
+            None, question_text.lower(), known_question.lower()
+        ).ratio()
+        score = (concept_score * 0.75) + (text_score * 0.25)
+        # Subject overlap is the strongest signal; wording such as
+        # "experience" vs "knowledge" should not block a safe match.
+        minimum_score = 0.55 if query_subjects.intersection(known_subjects) else threshold
+        if concept_score >= 0.5 and score >= minimum_score:
+            candidates.append((score, known_question, answer))
+
+    if candidates:
+        score, matched_question, answer = max(candidates, key=lambda item: item[0])
+        logger.info(
+            f"   ~ Normalized match ({score:.2f}): "
+            f"'{matched_question}' → using stored answer"
+        )
+        return answer
     return None
 
 
